@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/roman/workspace/ACS/distributed-deep-learning-lib/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

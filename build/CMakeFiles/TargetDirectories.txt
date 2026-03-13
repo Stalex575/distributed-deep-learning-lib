@@ -1,0 +1,3 @@
+/home/roman/workspace/ACS/distributed-deep-learning-lib/build/CMakeFiles/resnet_training.dir
+/home/roman/workspace/ACS/distributed-deep-learning-lib/build/CMakeFiles/edit_cache.dir
+/home/roman/workspace/ACS/distributed-deep-learning-lib/build/CMakeFiles/rebuild_cache.dir
