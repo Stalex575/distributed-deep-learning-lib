@@ -6,13 +6,14 @@
 
 struct ResidualBlockImpl : torch::nn::Module
 {
-    torch::nn::Conv2d conv1{nullptr};
-    torch::nn::BatchNorm2d bn1{nullptr};
-    torch::nn::Conv2d conv2{nullptr};
-    torch::nn::BatchNorm2d bn2{nullptr};
-    torch::nn::Sequential shortcut{nullptr};
+    torch::nn::Conv2d conv1{ nullptr };
+    torch::nn::BatchNorm2d bn1{ nullptr };
+    torch::nn::Conv2d conv2{ nullptr };
+    torch::nn::BatchNorm2d bn2{ nullptr };
+    torch::nn::Sequential shortcut{ nullptr };
 
-    ResidualBlockImpl(int64_t in_channels, int64_t out_channels, int64_t stride = 1) {
+    ResidualBlockImpl(int64_t in_channels, int64_t out_channels, int64_t stride = 1)
+    {
         conv1 = register_module("conv1", torch::nn::Conv2d(torch::nn::Conv2dOptions(in_channels, out_channels, 3)
             .stride(stride)
             .padding(1)
@@ -27,7 +28,8 @@ struct ResidualBlockImpl : torch::nn::Module
         );
         bn2 = register_module("bn2", torch::nn::BatchNorm2d(out_channels));
 
-        if (stride != 1 || in_channels != out_channels) {
+        if (stride != 1 || in_channels != out_channels)
+        {
             shortcut = register_module("shortcut", torch::nn::Sequential(
                 torch::nn::Conv2d(torch::nn::Conv2dOptions(in_channels, out_channels, 1)
                     .stride(stride)
@@ -35,7 +37,9 @@ struct ResidualBlockImpl : torch::nn::Module
                 ),
                 torch::nn::BatchNorm2d(out_channels)
             ));
-        } else {
+        }
+        else
+        {
             shortcut = register_module("shortcut", torch::nn::Sequential());
         }
     }
@@ -69,7 +73,8 @@ struct ResNetImpl : torch::nn::Module
     torch::nn::AdaptiveAvgPool2d avgpool{nullptr};
     torch::nn::Linear fc{nullptr};
 
-    ResNetImpl(int64_t num_classes = 10) {
+    ResNetImpl(int64_t num_classes = 10)
+    {
         conv1 = register_module("conv1", torch::nn::Conv2d(torch::nn::Conv2dOptions(3, 64, 3).stride(1).padding(1).bias(false)));
         bn1 = register_module("bn1", torch::nn::BatchNorm2d(64));
 
@@ -82,17 +87,20 @@ struct ResNetImpl : torch::nn::Module
         fc = register_module("fc", torch::nn::Linear(512, num_classes));
     }
 
-    torch::nn::Sequential _make_layer(int64_t out_channels, int64_t num_blocks, int64_t stride) {
+    torch::nn::Sequential _make_layer(int64_t out_channels, int64_t num_blocks, int64_t stride)
+    {
         torch::nn::Sequential layers;
         layers->push_back(ResidualBlock(in_channels, out_channels, stride));
         in_channels = out_channels;
-        for (int i = 1; i < num_blocks; ++i) {
+        for (int i = 1; i < num_blocks; ++i)
+        {
             layers->push_back(ResidualBlock(in_channels, out_channels, 1));
         }
         return layers;
     }
 
-    torch::Tensor forward(torch::Tensor x) {
+    torch::Tensor forward(torch::Tensor x)
+    {
         x = conv1->forward(x);
         x = bn1->forward(x);
         x = torch::relu(x);
@@ -117,17 +125,20 @@ int main()
 
     auto train_dataset = CIFAR10(data_path, CIFAR10::Mode::kTrain)
         .map(torch::data::transforms::Normalize<>({0.4914, 0.4822, 0.4465}, {0.2023, 0.1994, 0.2010}))
-        .map(torch::data::transforms::Stack<>());
+        .map(torch::data::transforms::Stack<>()
+    );
     
     auto train_loader = torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
-        std::move(train_dataset), torch::data::DataLoaderOptions().batch_size(128));
+        std::move(train_dataset), torch::data::DataLoaderOptions().batch_size(128)
+    );
 
     auto test_dataset = CIFAR10(data_path, CIFAR10::Mode::kTest)
         .map(torch::data::transforms::Normalize<>({0.4914, 0.4822, 0.4465}, {0.2023, 0.1994, 0.2010}))
         .map(torch::data::transforms::Stack<>());
     
     auto test_loader = torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
-        std::move(test_dataset), torch::data::DataLoaderOptions().batch_size(128));
+        std::move(test_dataset), torch::data::DataLoaderOptions().batch_size(128)
+    );
 
     ResNet model(10);
     model->to(device);
