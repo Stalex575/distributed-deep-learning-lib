@@ -22,10 +22,18 @@ if(NOT DEFINED CMAKE_PREFIX_PATH OR CMAKE_PREFIX_PATH STREQUAL "")
 endif()
 
 find_package(Torch REQUIRED)
+find_package(MPI QUIET)
 
 add_library(distdl INTERFACE)
 target_include_directories(distdl INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(distdl INTERFACE "${TORCH_LIBRARIES}")
+if(MPI_CXX_FOUND)
+	target_link_libraries(distdl INTERFACE MPI::MPI_CXX)
+	target_compile_definitions(distdl INTERFACE DISTDL_HAS_MPI=1)
+	message(STATUS "MPI found: enabling distdl distributed ops")
+else()
+	message(STATUS "MPI not found: distributed ops will be disabled")
+endif()
 
 add_executable(resnet_training resnet_example.cpp)
 

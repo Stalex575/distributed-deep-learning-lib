@@ -5,6 +5,7 @@
 #include <torch/torch.h>
 
 #include "cifar10_dataset.h"
+#include "distributed_ops.h"
 
 namespace distdl
 {
