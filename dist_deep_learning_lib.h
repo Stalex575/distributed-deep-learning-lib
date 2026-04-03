@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include <torch/torch.h>
 
@@ -122,4 +124,135 @@ struct ResNetImpl : torch::nn::Module
     }
 };
 TORCH_MODULE(ResNet);
+
+inline bool distributed_active()
+{
+    return distributed::is_initialized() && distributed::get_world_size() > 1;
+}
+
+inline void init_distributed_training()
+{
+    distributed::init();
+}
+
+inline void finalize_distributed_training()
+{
+    if (!distributed::is_initialized())
+    {
+        return;
+    }
+
+    if (distributed_active())
+    {
+        distributed::barrier();
+    }
+    distributed::finalize();
+}
+
+inline void broadcast_model_state(torch::nn::Module& module, int src_rank = 0)
+{
+    if (!distributed_active())
+    {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+
+    for (auto& parameter : module.parameters())
+    {
+        if (!parameter.defined())
+        {
+            continue;
+        }
+
+        torch::Tensor synced = parameter.detach().clone();
+        distributed::broadcast(synced, src_rank);
+        parameter.copy_(synced.to(parameter.device(), parameter.scalar_type()));
+    }
+
+    for (auto& buffer : module.buffers())
+    {
+        if (!buffer.defined())
+        {
+            continue;
+        }
+
+        torch::Tensor synced = buffer.detach().clone();
+        distributed::broadcast(synced, src_rank);
+        buffer.copy_(synced.to(buffer.device(), buffer.scalar_type()));
+    }
+
+    distributed::barrier();
+}
+
+inline void average_gradients(torch::nn::Module& module, int dst_rank = 0)
+{
+    if (!distributed_active())
+    {
+        return;
+    }
+
+    const int world = distributed::get_world_size();
+    const int rank = distributed::get_rank();
+    torch::NoGradGuard no_grad;
+
+    for (auto& parameter : module.parameters())
+    {
+        torch::Tensor grad = parameter.grad();
+        if (!grad.defined())
+        {
+            continue;
+        }
+
+        torch::Tensor reduced = torch::zeros_like(grad);
+        distributed::reduce(grad, reduced, dst_rank, distributed::ReduceOp::Sum);
+
+        if (rank == dst_rank)
+        {
+            reduced.div_(static_cast<double>(world));
+        }
+
+        distributed::broadcast(reduced, dst_rank);
+        grad.copy_(reduced.to(grad.device(), grad.scalar_type()));
+    }
+}
+
+inline torch::Tensor average_scalar_loss(const torch::Tensor& local_loss, int dst_rank = 0)
+{
+    if (local_loss.numel() != 1)
+    {
+        throw std::runtime_error("average_scalar_loss expects a scalar tensor");
+    }
+
+    if (!distributed_active())
+    {
+        return local_loss.detach().clone();
+    }
+
+    const int world = distributed::get_world_size();
+    const int rank = distributed::get_rank();
+
+    torch::Tensor reduced = torch::zeros_like(local_loss);
+    distributed::reduce(local_loss.detach(), reduced, dst_rank, distributed::ReduceOp::Sum);
+
+    if (rank == dst_rank)
+    {
+        reduced.div_(static_cast<double>(world));
+    }
+
+    distributed::broadcast(reduced, dst_rank);
+    return reduced;
+}
+
+inline bool rank_owns_batch(std::size_t global_batch_index)
+{
+    if (!distributed_active())
+    {
+        return true;
+    }
+
+    const std::size_t world = static_cast<std::size_t>(distributed::get_world_size());
+    const std::size_t rank = static_cast<std::size_t>(distributed::get_rank());
+    return (global_batch_index % world) == rank;
+}
 } // namespace distdl
