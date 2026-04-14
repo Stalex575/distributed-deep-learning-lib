@@ -1,5 +1,6 @@
 #include <torch/torch.h>
 #include <iostream>
+#include <cstdint>
 #include <string>
 
 #include "dist_deep_learning_lib.h"
@@ -8,17 +9,20 @@ int main()
 {
     distdl::init_distributed_training();
     const int rank = distdl::distributed::get_rank();
+    const int local_rank = distdl::distributed::get_local_rank();
     const int world = distdl::distributed::get_world_size();
 
     try
     {
-        torch::manual_seed(1337 + rank);
+        // Keep RNG consistent across ranks so RandomSampler produces the same
+        // global batch order, then shard each batch by rank.
+        torch::manual_seed(1337);
 
         torch::Device device(torch::kCPU);
         if (torch::cuda::is_available())
         {
             const int gpu_count = torch::cuda::device_count();
-            const int gpu_index = gpu_count > 0 ? (rank % gpu_count) : 0;
+            const int gpu_index = gpu_count > 0 ? (local_rank % gpu_count) : 0;
             device = torch::Device(torch::kCUDA, gpu_index);
         }
 
@@ -37,7 +41,8 @@ int main()
             .map(torch::data::transforms::Stack<>());
 
         auto train_loader = torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
-            std::move(train_dataset), torch::data::DataLoaderOptions().batch_size(128)
+            std::move(train_dataset),
+            torch::data::DataLoaderOptions().batch_size(128).drop_last(true)
         );
 
         auto test_dataset = CIFAR10(data_path, CIFAR10::Mode::kTest)
@@ -61,20 +66,28 @@ int main()
             double sum_loss = 0.0;
             int batch_idx = 0;
 
+            torch::manual_seed(1337 + epoch);
+
             for (auto& batch : *train_loader)
             {
-                auto inputs = batch.data.to(device);
-                auto labels = batch.target.to(device);
+                auto local_batch = distdl::shard_batch_for_rank(batch.data, batch.target, rank, world);
+                auto inputs = local_batch.first.to(device);
+                auto labels = local_batch.second.to(device);
+
+                if (inputs.size(0) == 0)
+                {
+                    continue;
+                }
 
                 optimizer.zero_grad();
                 auto outputs = model->forward(inputs);
                 auto loss = torch::nn::functional::cross_entropy(outputs, labels);
                 loss.backward();
 
-                distdl::average_gradients(*model, 0);
+                distdl::average_gradients(*model);
                 optimizer.step();
 
-                const auto mean_loss = distdl::average_scalar_loss(loss.detach(), 0);
+                const auto mean_loss = distdl::average_scalar_loss(loss.detach());
                 sum_loss += mean_loss.item<double>();
                 if (rank == 0 && (batch_idx + 1) % 10 == 0)
                 {
@@ -88,6 +101,11 @@ int main()
             }
         }
 
+        if (distdl::distributed_active())
+        {
+            distdl::distributed::barrier();
+        }
+
         if (rank == 0)
         {
             std::cout << "\nGradient matrices:\n";
@@ -98,27 +116,46 @@ int main()
                     std::cout << pair.key() << ": " << pair.value().grad().sizes() << "\n";
                 }
             }
+        }
 
-            model->eval();
-            int correct = 0;
-            int total = 0;
+        model->eval();
+        std::int64_t local_correct = 0;
+        std::int64_t local_total = 0;
 
+        {
+            torch::NoGradGuard no_grad;
+            for (const auto& batch : *test_loader)
             {
-                torch::NoGradGuard no_grad;
-                for (const auto& batch : *test_loader)
+                auto local_batch = distdl::shard_batch_for_rank(batch.data, batch.target, rank, world);
+                auto inputs = local_batch.first.to(device);
+                auto labels = local_batch.second.to(device);
+
+                if (inputs.size(0) == 0)
                 {
-                    auto inputs = batch.data.to(device);
-                    auto labels = batch.target.to(device);
-
-                    auto outputs = model->forward(inputs);
-                    auto prediction = outputs.argmax(1);
-
-                    total += labels.sizes()[0];
-                    correct += prediction.eq(labels).sum().item<int>();
+                    continue;
                 }
-            }
 
-            std::cout << "\nAccuracy on test set: " << (double)correct / total * 100.0 << "%" << std::endl;
+                auto outputs = model->forward(inputs);
+                auto prediction = outputs.argmax(1);
+
+                local_total += labels.sizes()[0];
+                local_correct += prediction.eq(labels).sum().item<std::int64_t>();
+            }
+        }
+
+        const auto local_correct_tensor = torch::tensor(local_correct, torch::TensorOptions().dtype(torch::kInt64));
+        const auto local_total_tensor = torch::tensor(local_total, torch::TensorOptions().dtype(torch::kInt64));
+        const auto global_correct_tensor = distdl::sum_scalar_tensor(local_correct_tensor);
+        const auto global_total_tensor = distdl::sum_scalar_tensor(local_total_tensor);
+
+        if (rank == 0)
+        {
+            const auto global_correct = global_correct_tensor.item<std::int64_t>();
+            const auto global_total = global_total_tensor.item<std::int64_t>();
+            const double accuracy = global_total > 0
+                ? (static_cast<double>(global_correct) / static_cast<double>(global_total) * 100.0)
+                : 0.0;
+            std::cout << "\nAccuracy on test set: " << accuracy << "%" << std::endl;
         }
 
         distdl::finalize_distributed_training();

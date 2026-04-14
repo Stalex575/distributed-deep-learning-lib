@@ -35,6 +35,20 @@ else()
 	message(STATUS "MPI not found: distributed ops will be disabled")
 endif()
 
+option(DISTDL_USE_MPI_ALLREDUCE "Use MPI_Allreduce in distdl allreduce helpers" OFF)
+if(DISTDL_USE_MPI_ALLREDUCE)
+	target_compile_definitions(distdl INTERFACE DISTDL_USE_MPI_ALLREDUCE=1)
+	message(STATUS "DISTDL_USE_MPI_ALLREDUCE enabled")
+endif()
+
 add_executable(resnet_training resnet_example.cpp)
 
 target_link_libraries(resnet_training PRIVATE distdl)
+
+option(ENABLE_TORCH_DIST_CPP_EXAMPLE "Build torch.distributed C++ example target" OFF)
+
+if(ENABLE_TORCH_DIST_CPP_EXAMPLE)
+	add_executable(resnet_torch_dist_training resnet_torch_dist_example.cpp)
+	target_link_libraries(resnet_torch_dist_training PRIVATE distdl)
+	target_compile_definitions(resnet_torch_dist_training PRIVATE USE_C10D_MPI=1)
+endif()

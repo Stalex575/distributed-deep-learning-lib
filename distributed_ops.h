@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,7 @@ inline void init() {}
 inline void finalize() {}
 inline bool is_initialized() { return false; }
 inline int get_rank() { return 0; }
+inline int get_local_rank() { return 0; }
 inline int get_world_size() { return 1; }
 
 inline void send(const torch::Tensor&, int, int = 0)
@@ -58,6 +60,11 @@ inline void gather(const torch::Tensor&, std::vector<torch::Tensor>&, int)
 }
 
 inline void scatter(torch::Tensor&, const std::vector<torch::Tensor>&, int)
+{
+    throw std::runtime_error("MPI support is not enabled (rebuild with MPI available)");
+}
+
+inline void allreduce(torch::Tensor&, ReduceOp = ReduceOp::Sum)
 {
     throw std::runtime_error("MPI support is not enabled (rebuild with MPI available)");
 }
@@ -100,6 +107,62 @@ inline int world_size()
     int world = 1;
     mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &world), "MPI_Comm_size");
     return world;
+}
+
+inline int try_parse_env_int(const char* name)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0')
+    {
+        return -1;
+    }
+
+    try
+    {
+        return std::stoi(value);
+    }
+    catch (...)
+    {
+        return -1;
+    }
+}
+
+inline int local_rank_from_env_or_global()
+{
+    const int local_rank = [&]() {
+        const int ompi = try_parse_env_int("OMPI_COMM_WORLD_LOCAL_RANK");
+        if (ompi >= 0)
+        {
+            return ompi;
+        }
+
+        const int mvapich = try_parse_env_int("MV2_COMM_WORLD_LOCAL_RANK");
+        if (mvapich >= 0)
+        {
+            return mvapich;
+        }
+
+        const int intel_mpi = try_parse_env_int("MPI_LOCALRANKID");
+        if (intel_mpi >= 0)
+        {
+            return intel_mpi;
+        }
+
+        const int slurm = try_parse_env_int("SLURM_LOCALID");
+        if (slurm >= 0)
+        {
+            return slurm;
+        }
+
+        return -1;
+    }();
+
+    if (local_rank >= 0)
+    {
+        return local_rank;
+    }
+
+    return world_rank();
 }
 
 inline void send_buffer(const std::vector<std::byte>& buffer, int dst, int tag)
@@ -236,14 +299,23 @@ inline int get_world_size()
     return detail::world_size();
 }
 
+inline int get_local_rank()
+{
+    if (!is_initialized())
+    {
+        return 0;
+    }
+    return detail::local_rank_from_env_or_global();
+}
+
 inline void send(const torch::Tensor& tensor, int dst, int tag = 0)
 {
-    detail::send_buffer(serialize(tensor), dst, tag);
+    detail::send_buffer(distdl::serialize(tensor), dst, tag);
 }
 
 inline void recv(torch::Tensor& tensor, int src, int tag = 0)
 {
-    torch::Tensor out = deserialize(detail::recv_buffer(src, tag));
+    torch::Tensor out = distdl::deserialize(detail::recv_buffer(src, tag));
     if (tensor.defined())
     {
         out = out.to(tensor.device(), tensor.scalar_type());
@@ -256,11 +328,11 @@ inline void broadcast(torch::Tensor& tensor, int src)
     std::vector<std::byte> buffer;
     if (detail::world_rank() == src)
     {
-        buffer = serialize(tensor);
+        buffer = distdl::serialize(tensor);
     }
     detail::broadcast_buffer(buffer, src);
 
-    torch::Tensor out = deserialize(buffer);
+    torch::Tensor out = distdl::deserialize(buffer);
     if (tensor.defined())
     {
         out = out.to(tensor.device(), tensor.scalar_type());
@@ -313,8 +385,8 @@ inline void gather(const torch::Tensor& input, std::vector<torch::Tensor>& gathe
         for (int r = 0; r < world; ++r)
         {
             torch::Tensor out = (r == dst)
-                ? deserialize(serialize(input))
-                : deserialize(detail::recv_buffer(r, base_tag));
+                ? distdl::deserialize(distdl::serialize(input))
+                : distdl::deserialize(detail::recv_buffer(r, base_tag));
 
             if (gather_list[static_cast<size_t>(r)].defined())
             {
@@ -328,7 +400,7 @@ inline void gather(const torch::Tensor& input, std::vector<torch::Tensor>& gathe
     }
     else
     {
-        detail::send_buffer(serialize(input), dst, base_tag);
+        detail::send_buffer(distdl::serialize(input), dst, base_tag);
     }
 }
 
@@ -352,18 +424,69 @@ inline void scatter(torch::Tensor& output, const std::vector<torch::Tensor>& sca
                 output = scatter_list[static_cast<size_t>(r)];
                 continue;
             }
-            detail::send_buffer(serialize(scatter_list[static_cast<size_t>(r)]), r, base_tag);
+            detail::send_buffer(distdl::serialize(scatter_list[static_cast<size_t>(r)]), r, base_tag);
         }
     }
     else
     {
-        torch::Tensor out = deserialize(detail::recv_buffer(src, base_tag));
+        torch::Tensor out = distdl::deserialize(detail::recv_buffer(src, base_tag));
         if (output.defined())
         {
             out = out.to(output.device(), output.scalar_type());
         }
         output = out;
     }
+}
+
+inline void allreduce(torch::Tensor& tensor, ReduceOp op = ReduceOp::Sum)
+{
+    const torch::Tensor cpu = tensor.to(torch::kCPU).contiguous();
+    const int count = detail::to_int_count(cpu.numel(), "allreduce element count");
+    const MPI_Datatype mpi_dt = detail::dtype_to_mpi(cpu.scalar_type());
+    const MPI_Op mpi_op = detail::reduce_to_mpi(op);
+
+#if defined(DISTDL_USE_MPI_ALLREDUCE) && DISTDL_USE_MPI_ALLREDUCE
+    torch::Tensor result = torch::empty_like(cpu);
+    detail::mpi_check(
+        MPI_Allreduce(
+            cpu.data_ptr(),
+            result.data_ptr(),
+            count,
+            mpi_dt,
+            mpi_op,
+            MPI_COMM_WORLD
+        ),
+        "MPI_Allreduce"
+    );
+#else
+    // Fallback: reduce to rank 0, then broadcast.
+    constexpr int root = 0;
+    torch::Tensor result = torch::zeros_like(cpu);
+    detail::mpi_check(
+        MPI_Reduce(
+            cpu.data_ptr(),
+            result.data_ptr(),
+            count,
+            mpi_dt,
+            mpi_op,
+            root,
+            MPI_COMM_WORLD
+        ),
+        "MPI_Reduce(allreduce fallback)"
+    );
+    detail::mpi_check(
+        MPI_Bcast(
+            result.data_ptr(),
+            count,
+            mpi_dt,
+            root,
+            MPI_COMM_WORLD
+        ),
+        "MPI_Bcast(allreduce fallback)"
+    );
+#endif
+
+    tensor = result.to(tensor.device(), tensor.scalar_type());
 }
 
 inline void barrier()
