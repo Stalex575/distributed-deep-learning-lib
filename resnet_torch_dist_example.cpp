@@ -45,6 +45,43 @@ int env_to_int(const char* name, int fallback)
 DistConfig read_dist_config()
 {
     DistConfig cfg;
+
+    cfg.rank = env_to_int("RANK", -1);
+    if (cfg.rank < 0)
+    {
+        cfg.rank = env_to_int("OMPI_COMM_WORLD_RANK", -1);
+    }
+    if (cfg.rank < 0)
+    {
+        cfg.rank = env_to_int("PMI_RANK", -1);
+    }
+    if (cfg.rank < 0)
+    {
+        cfg.rank = env_to_int("MV2_COMM_WORLD_RANK", -1);
+    }
+    if (cfg.rank < 0)
+    {
+        cfg.rank = env_to_int("SLURM_PROCID", 0);
+    }
+
+    cfg.world_size = env_to_int("WORLD_SIZE", -1);
+    if (cfg.world_size < 0)
+    {
+        cfg.world_size = env_to_int("OMPI_COMM_WORLD_SIZE", -1);
+    }
+    if (cfg.world_size < 0)
+    {
+        cfg.world_size = env_to_int("PMI_SIZE", -1);
+    }
+    if (cfg.world_size < 0)
+    {
+        cfg.world_size = env_to_int("MV2_COMM_WORLD_SIZE", -1);
+    }
+    if (cfg.world_size < 0)
+    {
+        cfg.world_size = env_to_int("SLURM_NTASKS", 1);
+    }
+
     cfg.local_rank = env_to_int("LOCAL_RANK", -1);
     if (cfg.local_rank < 0)
     {
@@ -62,13 +99,19 @@ DistConfig read_dist_config()
     {
         cfg.local_rank = env_to_int("SLURM_LOCALID", -1);
     }
+
+    if (cfg.local_rank < 0)
+    {
+        cfg.local_rank = cfg.rank;
+    }
+
     return cfg;
 }
 
 c10::intrusive_ptr<c10d::Backend> create_pg_mpi()
 {
 #if defined(USE_C10D_MPI)
-    return c10d::ProcessGroupMPI::createProcessGroupMPI();
+    return c10d::ProcessGroupMPI::createProcessGroupMPI(std::vector<int>{});
 #else
     throw std::runtime_error("Libtorch in this environment was built without USE_C10D_MPI");
 #endif
@@ -163,12 +206,10 @@ void broadcast_model(torch::nn::Module& module, const c10::intrusive_ptr<c10d::B
     }
 }
 
-void sync_grads_reduce_broadcast(
+void sync_grads_allreduce(
     torch::nn::Module& module,
     const c10::intrusive_ptr<c10d::Backend>& pg,
-    int rank,
-    int world_size,
-    int root_rank = 0
+    int world_size
 )
 {
     if (!pg_active(pg, world_size))
@@ -176,14 +217,9 @@ void sync_grads_reduce_broadcast(
         return;
     }
 
-    c10d::ReduceOptions ro;
-    ro.rootRank = root_rank;
-    ro.reduceOp = c10d::ReduceOp::SUM;
-    ro.asyncOp = false;
-
-    c10d::BroadcastOptions bo;
-    bo.rootRank = root_rank;
-    bo.asyncOp = false;
+    c10d::AllreduceOptions ao;
+    ao.reduceOp = c10d::ReduceOp::SUM;
+    ao.asyncOp = false;
 
     torch::NoGradGuard ng;
 
@@ -198,23 +234,17 @@ void sync_grads_reduce_broadcast(
         torch::Tensor comm = g.detach().to(torch::kCPU).contiguous().clone();
         std::vector<torch::Tensor> t{comm};
 
-        pg->reduce(t, ro)->wait();
-        if (rank == root_rank)
-        {
-            comm.div_(static_cast<double>(world_size));
-        }
-        pg->broadcast(t, bo)->wait();
+        pg->allreduce(t, ao)->wait();
+        comm.div_(static_cast<double>(world_size));
 
         g.copy_(comm.to(g.device(), g.scalar_type()));
     }
 }
 
-torch::Tensor average_loss_reduce_broadcast(
+torch::Tensor average_loss_allreduce(
     const torch::Tensor& local_loss,
     const c10::intrusive_ptr<c10d::Backend>& pg,
-    int rank,
-    int world_size,
-    int root_rank = 0
+    int world_size
 )
 {
     if (!pg_active(pg, world_size))
@@ -222,14 +252,9 @@ torch::Tensor average_loss_reduce_broadcast(
         return local_loss.detach().clone();
     }
 
-    c10d::ReduceOptions ro;
-    ro.rootRank = root_rank;
-    ro.reduceOp = c10d::ReduceOp::SUM;
-    ro.asyncOp = false;
-
-    c10d::BroadcastOptions bo;
-    bo.rootRank = root_rank;
-    bo.asyncOp = false;
+    c10d::AllreduceOptions ao;
+    ao.reduceOp = c10d::ReduceOp::SUM;
+    ao.asyncOp = false;
 
     torch::Tensor comm = local_loss.detach();
     if (comm.is_cuda())
@@ -239,44 +264,34 @@ torch::Tensor average_loss_reduce_broadcast(
     comm = comm.clone();
 
     std::vector<torch::Tensor> t{comm};
-    pg->reduce(t, ro)->wait();
-    if (rank == root_rank)
-    {
-        comm.div_(static_cast<double>(world_size));
-    }
-    pg->broadcast(t, bo)->wait();
+    pg->allreduce(t, ao)->wait();
+    comm.div_(static_cast<double>(world_size));
 
     return comm.to(local_loss.device(), local_loss.scalar_type());
 }
 
-torch::Tensor sum_i64_reduce_broadcast(
+torch::Tensor sum_i64_allreduce(
     std::int64_t local_value,
     const c10::intrusive_ptr<c10d::Backend>& pg,
     const torch::Device& device,
-    int root_rank = 0
+    int world_size
 )
 {
     torch::Tensor local = torch::tensor(local_value, torch::TensorOptions().dtype(torch::kInt64).device(device));
-    if (!pg)
+    if (!pg_active(pg, world_size))
     {
         return local;
     }
 
-    c10d::ReduceOptions ro;
-    ro.rootRank = root_rank;
-    ro.reduceOp = c10d::ReduceOp::SUM;
-    ro.asyncOp = false;
-
-    c10d::BroadcastOptions bo;
-    bo.rootRank = root_rank;
-    bo.asyncOp = false;
+    c10d::AllreduceOptions ao;
+    ao.reduceOp = c10d::ReduceOp::SUM;
+    ao.asyncOp = false;
 
     torch::Tensor comm = local.is_cuda() ? local.to(torch::kCPU) : local;
     comm = comm.clone();
     std::vector<torch::Tensor> t{comm};
 
-    pg->reduce(t, ro)->wait();
-    pg->broadcast(t, bo)->wait();
+    pg->allreduce(t, ao)->wait();
 
     return comm.to(device, torch::kInt64);
 }
@@ -307,7 +322,8 @@ int main()
 
         if (cfg.rank == 0)
         {
-            std::cout << "[torch.dist/c10d] backend=mpi world_size=" << cfg.world_size << std::endl;
+            std::cout << "[torch.dist/c10d] backend=" << pg->getBackendName()
+                      << " world_size=" << cfg.world_size << std::endl;
         }
 
         torch::manual_seed(1337);
@@ -338,7 +354,7 @@ int main()
 
         torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(0.001));
 
-        const int epochs = 5;
+        const int epochs = 1;
         for (int epoch = 0; epoch < epochs; ++epoch)
         {
             model->train();
@@ -362,10 +378,10 @@ int main()
                 auto loss = torch::nn::functional::cross_entropy(outputs, labels);
                 loss.backward();
 
-                sync_grads_reduce_broadcast(*model, pg, cfg.rank, cfg.world_size, 0);
+                sync_grads_allreduce(*model, pg, cfg.world_size);
                 optimizer.step();
 
-                auto avg_loss = average_loss_reduce_broadcast(loss.detach(), pg, cfg.rank, cfg.world_size, 0);
+                auto avg_loss = average_loss_allreduce(loss.detach(), pg, cfg.world_size);
                 running_loss += avg_loss.item<double>();
 
                 if (cfg.rank == 0 && (batch_idx + 1) % 10 == 0)
@@ -403,8 +419,8 @@ int main()
             }
         }
 
-        auto global_correct = sum_i64_reduce_broadcast(local_correct, pg, device, 0).item<std::int64_t>();
-        auto global_total = sum_i64_reduce_broadcast(local_total, pg, device, 0).item<std::int64_t>();
+        auto global_correct = sum_i64_allreduce(local_correct, pg, device, cfg.world_size).item<std::int64_t>();
+        auto global_total = sum_i64_allreduce(local_total, pg, device, cfg.world_size).item<std::int64_t>();
 
         if (cfg.rank == 0)
         {

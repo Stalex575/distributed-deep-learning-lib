@@ -2,3 +2,5 @@ data/
 build/
 .venv/
 .vscode/
+third_party/pytorch/
+torch_mpi_build.log

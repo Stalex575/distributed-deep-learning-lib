@@ -1,0 +1,2 @@
+resnet_example.cpp, MPI_AllReduce, 8 processes ~ 700 s.
+resnet_torch_dist_example, 8 processes, elapsed=629.26

@@ -59,7 +59,7 @@ int main()
 
         torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(0.001));
 
-        const int epochs = 5;
+        const int epochs = 1;
         for (int epoch = 0; epoch < epochs; ++epoch)
         {
             model->train();

@@ -2,26 +2,19 @@
 
 set -euo pipefail
 
-GENERATOR="Unix Makefiles"
-
-if [ ! -d "build" ]; then
-    echo "Creating build directory..."
-    mkdir build
-fi
-
-TORCH_CMAKE_PREFIX=/opt/libtorch
-
-cd build
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
+GENERATOR="${GENERATOR:-Unix Makefiles}"
+JOBS="${JOBS:-$(nproc)}"
 
 echo "Generating CMake files..."
-
 cmake -G "$GENERATOR" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_PREFIX_PATH="$TORCH_CMAKE_PREFIX" \
-      ..
+    -B "$BUILD_DIR" \
+    -S "$ROOT_DIR" \
+    "$@"
 
 echo "Compiling project..."
-cmake --build . --config Release --parallel
+cmake --build "$BUILD_DIR" --parallel "$JOBS"
 
 echo ""
 echo "Build complete!"
