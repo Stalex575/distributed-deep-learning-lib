@@ -15,6 +15,50 @@ sudo apt install -y \
 
 If you use a custom MPI install (for example `$HOME/.local/mpich`), keep it available and set `MPI_HOME` when running setup scripts.
 
+## Quick Setup and Compilation
+
+### A. Local laptop with CPU + MPI backend
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j
+cd ..
+
+mpirun -n 1 ./build/resnet_training --backend mpi
+mpirun -n 4 ./build/resnet_training --backend mpi
+```
+
+### B. Local laptop with GPU + NCCL backend
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install nvidia-nccl-cu12
+
+python -c "import torch; print('cuda:', torch.cuda.is_available(), 'nccl:', torch.cuda.nccl.version())"
+
+TORCH_LIB=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+NCCL_INC=$(python -c "import os, nvidia.nccl; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), 'include'))")
+
+mkdir -p build && cd build
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DDISTDL_ENABLE_NCCL=ON \
+    -DNCCL_LIBRARY="${TORCH_LIB}/libnccl.so.2" \
+    -DNCCL_INCLUDE_DIR="${NCCL_INC}"
+cmake --build . -j
+cd ..
+
+export LD_LIBRARY_PATH=${TORCH_LIB}:${LD_LIBRARY_PATH}
+mpirun -n 1 ./build/resnet_training --backend nccl
+```
+
 ## Virtual Environment Setup From Scratch
 
 Create and populate `.venv` with Python deps and a Torch wheel:
